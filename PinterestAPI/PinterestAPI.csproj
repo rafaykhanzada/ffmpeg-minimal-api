@@ -9,4 +9,10 @@
 	<PublishTrimmed>true</PublishTrimmed>-->
   </PropertyGroup>
 
+	<ItemGroup>
+		<Content Update="wwwroot\**\*">
+			<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+		</Content>
+	</ItemGroup>
+
 </Project>

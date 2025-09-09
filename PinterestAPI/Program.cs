@@ -1,173 +1,207 @@
 using System.Diagnostics;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Add services
+builder.Services.AddSingleton<IVideoProcessor, VideoProcessor>();
+builder.Services.Configure<VideoSettings>(builder.Configuration.GetSection("VideoSettings"));
+
 var app = builder.Build();
-// ?? Use your custom ffmpeg path
-var ffmpegPath = builder.Configuration["FfmpegPath"] ?? "ffmpeg";
-var videoDir = Path.Combine(Directory.GetCurrentDirectory(), "videos");
+
+// Configure static files
+var videoDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
 Directory.CreateDirectory(videoDir);
 
-// Serve static files -> http://localhost:5000/videos/filename.mp4
 app.UseStaticFiles(new StaticFileOptions
 {
     FileProvider = new PhysicalFileProvider(videoDir),
-    RequestPath = "/videos"
+    RequestPath = "",
+    ContentTypeProvider = GetContentTypeProvider()
 });
 
-app.MapGet("/", () => Results.Ok("Video Downloader API is running. Use /download?url=...&filename=... & Use /upload?url=...&filename=..."));
-//([FromQuery] string? url, [FromQuery] string? outputDir, [FromQuery] string? filename)
-app.MapPost("/fetch", async (HttpRequest req) =>
+// Routes
+app.MapGet("/", () => Results.Ok(new
+{
+    status = "Video Processing API is running",
+    endpoints = new[]
+    {
+        "POST /download?url=...&filename=...",
+        "POST /upload?url=...&filename=...&outputDir=...",
+        "POST /fetch?url=...&filename=...&outputDir=..."
+    }
+}));
+
+app.MapPost("/download", async (string url, string? filename, IVideoProcessor processor) =>
+{
+    if (string.IsNullOrWhiteSpace(url))
+        return Results.BadRequest(new { error = "URL is required" });
+
+    var result = await processor.DownloadVideoAsync(url, filename);
+    return result.Success
+        ? Results.Ok(result)
+        : Results.Problem(result.Error, statusCode: 500);
+});
+
+app.MapPost("/upload", async (HttpRequest req, IVideoProcessor processor) =>
 {
     var url = req.Query["url"].ToString();
-    if (string.IsNullOrWhiteSpace(url))
-        return Results.BadRequest(new { error = "Missing ?url param" });
-
-    // File name (without extension)
-    var name = string.IsNullOrWhiteSpace(req.Query["filename"])
-        ? Guid.NewGuid().ToString()
-        : Path.GetFileNameWithoutExtension(req.Query["filename"].ToString());
-
-    // Output directory
+    var filename = req.Query["filename"].ToString();
     var outputDir = req.Query["outputDir"].ToString();
-    var rootDir = string.IsNullOrWhiteSpace(outputDir)
-        ? Path.Combine(Directory.GetCurrentDirectory(), "videos")
-        : Path.GetFullPath(outputDir);
 
-    // Ensure directory exists
-    Directory.CreateDirectory(rootDir);
+    if (string.IsNullOrWhiteSpace(url))
+        return Results.BadRequest(new { error = "URL is required" });
 
-    // Paths for output
-    var outputM3u8 = Path.Combine(rootDir, $"{name}.m3u8");
-    var segmentPattern = Path.Combine(rootDir, "segment_%03d.ts");
-
-    // FFmpeg command
-    var arguments =
-        $"-i \"{url}\" -c copy -f hls -hls_time 6 -hls_playlist_type vod " +
-        $"-hls_segment_filename \"{segmentPattern}\" \"{outputM3u8}\"";
-
-    var startInfo = new ProcessStartInfo(ffmpegPath, arguments)
-    {
-        RedirectStandardError = true,
-        RedirectStandardOutput = true,
-        UseShellExecute = false,
-        CreateNoWindow = true
-    };
-
-    try
-    {
-        using var ffmpeg = Process.Start(startInfo)!;
-
-        string stderr = await ffmpeg.StandardError.ReadToEndAsync();
-        string stdout = await ffmpeg.StandardOutput.ReadToEndAsync();
-
-        await ffmpeg.WaitForExitAsync();
-
-        if (ffmpeg.ExitCode == 0)
-        {
-            return Results.Ok(new
-            {
-                success = true,
-                playlist = outputM3u8,
-                folder = rootDir
-            });
-        }
-        else
-        {
-            return Results.Problem($"FFmpeg failed with exit code {ffmpeg.ExitCode}", stderr);
-        }
-    }
-    catch (Exception ex)
-    {
-        return Results.Problem($"Exception: {ex.Message}", ex.ToString());
-    }
+    var result = await processor.ConvertToHlsAsync(url, filename, outputDir, req.Scheme, req.Host.ToString());
+    return result.Success
+        ? Results.Ok(result)
+        : Results.Problem(result.Error, statusCode: 500);
 });
 
-
-// API: POST /download?url=...&filename=... download?url=https://v1.pinimg.com/videos/iht/hls/0c/c1/e7/0cc1e72b25279e82237a29bcb5ff6232.m3u8&filename=newvideo123.mp4
-app.MapPost("/download", async (HttpRequest req) =>
+app.MapPost("/fetch", async (HttpRequest req, IVideoProcessor processor) =>
 {
-    try
+    var url = req.Query["url"].ToString();
+    var filename = req.Query["filename"].ToString();
+    var outputDir = req.Query["outputDir"].ToString();
+
+    if (string.IsNullOrWhiteSpace(url))
+        return Results.BadRequest(new { error = "URL is required" });
+
+    var result = await processor.FetchAsHlsAsync(url, filename, outputDir, req.Scheme, req.Host.ToString());
+    return result.Success
+        ? Results.Ok(result)
+        : Results.Problem(result.Error, statusCode: 500);
+});
+
+app.Run();
+
+// Helper methods
+static FileExtensionContentTypeProvider GetContentTypeProvider()
+{
+    var provider = new FileExtensionContentTypeProvider();
+    provider.Mappings[".m3u8"] = "application/vnd.apple.mpegurl";
+    provider.Mappings[".ts"] = "video/mp2t";
+    return provider;
+}
+
+// Models and Services
+public class VideoSettings
+{
+    public string FfmpegPath { get; set; } = "ffmpeg";
+    public int HlsSegmentTime { get; set; } = 6;
+    public string RootDirectory { get; set; } = "wwwroot";
+}
+
+public interface IVideoProcessor
+{
+    Task<ProcessResult> DownloadVideoAsync(string url, string? filename);
+    Task<ProcessResult> ConvertToHlsAsync(string url, string? filename, string? outputDir, string scheme, string host);
+    Task<ProcessResult> FetchAsHlsAsync(string url, string? filename, string? outputDir, string scheme, string host);
+}
+
+public class VideoProcessor : IVideoProcessor
+{
+    private readonly VideoSettings _settings;
+    private readonly ILogger<VideoProcessor> _logger;
+
+    public VideoProcessor(IOptions<VideoSettings> settings, ILogger<VideoProcessor> logger)
     {
-        var url = req.Query["url"].ToString();
-        var filename = string.IsNullOrWhiteSpace(req.Query["filename"])
-            ? $"{Guid.NewGuid()}.mp4"
-            : req.Query["filename"].ToString();
+        _settings = settings.Value;
+        _logger = logger;
+    }
 
-        if (string.IsNullOrWhiteSpace(url))
-            return Results.BadRequest(new { error = "Missing ?url param" });
-
-        var output = Path.Combine(videoDir, filename);
-
-        var ffmpeg = new Process
+    public async Task<ProcessResult> DownloadVideoAsync(string url, string? filename)
+    {
+        try
         {
-            StartInfo = new ProcessStartInfo(ffmpegPath, $"-i \"{url}\" -y -c copy \"{output}\"")
+            filename = NormalizeFilename(filename, ".mp4");
+            var outputPath = Path.Combine(_settings.RootDirectory, filename);
+
+            var args = $"-i \"{url}\" -y -c copy \"{outputPath}\"";
+            var result = await RunFfmpegAsync(args);
+
+            if (result.Success)
             {
-                RedirectStandardError = true, // capture FFmpeg logs
-                RedirectStandardOutput = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
+                result.Data = new { url = $"/videos/{filename}" };
             }
-        };
 
-        ffmpeg.Start();
-
-        // capture logs
-        var stderr = await ffmpeg.StandardError.ReadToEndAsync();
-        var stdout = await ffmpeg.StandardOutput.ReadToEndAsync();
-
-        await ffmpeg.WaitForExitAsync();
-
-        if (ffmpeg.ExitCode == 0)
-        {
-            var fileUrl = $"http://{req.Host}/videos/{filename}";
-            return Results.Ok(new { success = true, url = fileUrl });
+            return result;
         }
-        else
+        catch (Exception ex)
         {
-            return Results.Problem($"FFmpeg failed with exit code {ffmpeg.ExitCode}",  stderr);
+            _logger.LogError(ex, "Download failed for URL: {Url}", url);
+            return ProcessResult.Failure($"Download failed: {ex.Message}");
         }
     }
-    catch (Exception ex)
+
+    public async Task<ProcessResult> ConvertToHlsAsync(string url, string? filename, string? outputDir, string scheme, string host)
     {
-        return Results.Problem($"Exception: {ex.Message}", ex.ToString());
-    }
-});
-
-// Upload ->/upload?url=C:\Users\rafay\Downloads\response.mp4&filename=robot&outputDir=C:\Users\rafay\Documents\Projects\personal\pinter\test\nwe\sam2
-app.MapPost("/upload", async (HttpRequest req) =>
-{
-    try
-    {
-        var url = req.Query["url"].ToString();
-        var name = string.IsNullOrWhiteSpace(req.Query["filename"])
-            ? Guid.NewGuid().ToString()
-            : Path.GetFileNameWithoutExtension(req.Query["filename"].ToString());
-
-        var customOutputDir = req.Query["outputDir"].ToString();
-        var rootDir = string.IsNullOrWhiteSpace(customOutputDir)
-            ? videoDir
-            : Path.GetFullPath(customOutputDir);
-
-        if (string.IsNullOrWhiteSpace(url))
-            return Results.BadRequest(new { error = "Missing ?url param" });
-
-        // Folder where this video will be saved
-        var outputFolder = Path.Combine(rootDir);
-        if (!Directory.Exists(outputFolder))
-            Directory.CreateDirectory(outputFolder);
-        var outputM3U8 = Path.Combine(outputFolder, $"{name}.m3u8");
-
-        // FFmpeg command: MP4 -> HLS
-        var arguments =
-            $"-i \"{url}\" -c:v h264 -c:a aac -strict -2 -f hls " +
-            $"-hls_time 6 -hls_playlist_type vod " +
-            $"-hls_segment_filename \"{Path.Combine(outputFolder, "segment_%03d.ts")}\" " +
-            $"\"{outputM3U8}\"";
-
-        var ffmpeg = new Process
+        try
         {
-            StartInfo = new ProcessStartInfo(ffmpegPath, arguments)
+            var (outputPath, segmentPattern, relativePath) = PrepareHlsOutput(filename, outputDir);
+
+            var args = $"-i \"{url}\" -c:v h264 -c:a aac -strict -2 -f hls " +
+                      $"-hls_time {_settings.HlsSegmentTime} -hls_playlist_type vod " +
+                      $"-hls_segment_filename \"{segmentPattern}\" \"{outputPath}\"";
+
+            var result = await RunFfmpegAsync(args);
+
+            if (result.Success)
+            {
+                result.Data = new
+                {
+                    path = $"{scheme}://{host}{relativePath}",
+                    folder = Path.GetDirectoryName(outputPath)
+                };
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "HLS conversion failed for URL: {Url}", url);
+            return ProcessResult.Failure($"Conversion failed: {ex.Message}");
+        }
+    }
+
+    public async Task<ProcessResult> FetchAsHlsAsync(string url, string? filename, string? outputDir, string scheme, string host)
+    {
+        try
+        {
+            var (outputPath, segmentPattern, relativePath) = PrepareHlsOutput(filename, outputDir);
+
+            var args = $"-i \"{url}\" -c copy -f hls " +
+                      $"-hls_time {_settings.HlsSegmentTime} -hls_playlist_type vod " +
+                      $"-hls_segment_filename \"{segmentPattern}\" \"{outputPath}\"";
+
+            var result = await RunFfmpegAsync(args);
+
+            if (result.Success)
+            {
+                result.Data = new
+                {
+                    playlist = outputPath,
+                    folder = Path.GetDirectoryName(outputPath),
+                    url = $"{scheme}://{host}{relativePath}"
+                };
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "HLS fetch failed for URL: {Url}", url);
+            return ProcessResult.Failure($"Fetch failed: {ex.Message}");
+        }
+    }
+
+    private async Task<ProcessResult> RunFfmpegAsync(string arguments)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo(_settings.FfmpegPath, arguments)
             {
                 RedirectStandardError = true,
                 RedirectStandardOutput = true,
@@ -176,31 +210,56 @@ app.MapPost("/upload", async (HttpRequest req) =>
             }
         };
 
-        ffmpeg.Start();
+        process.Start();
 
-        var stderr = await ffmpeg.StandardError.ReadToEndAsync();
-        var stdout = await ffmpeg.StandardOutput.ReadToEndAsync();
+        var stderr = await process.StandardError.ReadToEndAsync();
+        var stdout = await process.StandardOutput.ReadToEndAsync();
 
-        await ffmpeg.WaitForExitAsync();
+        await process.WaitForExitAsync();
 
-        if (ffmpeg.ExitCode == 0)
+        if (process.ExitCode == 0)
         {
-            return Results.Ok(new
-            {
-                success = true,
-                path = outputM3U8,
-                folder = outputFolder
-            });
+            _logger.LogInformation("FFmpeg process completed successfully");
+            return ProcessResult.Ok();
         }
-        else
-        {
-            return Results.Problem($"FFmpeg failed with exit code {ffmpeg.ExitCode}", stderr);
-        }
+
+        _logger.LogError("FFmpeg failed with exit code {ExitCode}: {Error}", process.ExitCode, stderr);
+        return ProcessResult.Failure($"FFmpeg failed with exit code {process.ExitCode}");
     }
-    catch (Exception ex)
+
+    private (string outputPath, string segmentPattern, string relativePath) PrepareHlsOutput(string? filename, string? outputDir)
     {
-        return Results.Problem($"Exception: {ex.Message}", ex.ToString());
-    }
-});
+        var name = NormalizeFilename(filename);
+        var directory = string.IsNullOrWhiteSpace(outputDir)
+            ? Path.Combine(Directory.GetCurrentDirectory(), "videos")
+            : Path.Combine(_settings.RootDirectory, outputDir);
 
-app.Run();
+        Directory.CreateDirectory(directory);
+
+        var m3u8File = $"{name}.m3u8";
+        var outputPath = Path.Combine(directory, m3u8File);
+        var segmentPattern = Path.Combine(directory, $"{name}_segment_%03d.ts");
+        var relativePath = "/" + Path.Combine(outputDir ?? "", m3u8File).Replace("\\", "/");
+
+        return (outputPath, segmentPattern, relativePath);
+    }
+
+    private string NormalizeFilename(string? filename, string extension = "")
+    {
+        if (string.IsNullOrWhiteSpace(filename))
+            return Guid.NewGuid().ToString() + extension;
+
+        var name = Path.GetFileNameWithoutExtension(filename);
+        return string.IsNullOrWhiteSpace(name) ? Guid.NewGuid().ToString() : name + extension;
+    }
+}
+
+public class ProcessResult
+{
+    public bool Success { get; set; }
+    public string? Error { get; set; }
+    public object? Data { get; set; }
+
+    public static ProcessResult Ok(object? data = null) => new() { Success = true, Data = data };
+    public static ProcessResult Failure(string error) => new() { Success = false, Error = error };
+}
