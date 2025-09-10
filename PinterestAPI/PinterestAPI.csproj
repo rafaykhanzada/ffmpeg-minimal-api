@@ -15,4 +15,8 @@
 		</Content>
 	</ItemGroup>
 
+	<ItemGroup>
+	  <Folder Include="wwwroot\Uploads\Art\Video\f5569c62-eced-4bee-afd3-36cad1d479a8\" />
+	</ItemGroup>
+
 </Project>

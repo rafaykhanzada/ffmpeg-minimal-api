@@ -9,18 +9,30 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<IVideoProcessor, VideoProcessor>();
 builder.Services.Configure<VideoSettings>(builder.Configuration.GetSection("VideoSettings"));
 
+// Add CORS services
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowAll", policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader();
+    });
+});
 var app = builder.Build();
 
+app.UseCors("AllowAll");
 // Configure static files
 var videoDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
 Directory.CreateDirectory(videoDir);
 
-app.UseStaticFiles(new StaticFileOptions
-{
-    FileProvider = new PhysicalFileProvider(videoDir),
-    RequestPath = "",
-    ContentTypeProvider = GetContentTypeProvider()
-});
+app.UseStaticFiles(
+    new StaticFileOptions
+    {
+        FileProvider = new PhysicalFileProvider(videoDir),
+        RequestPath = "",
+        ContentTypeProvider = GetContentTypeProvider()
+    });
 
 // Routes
 app.MapGet("/", () => Results.Ok(new
@@ -49,12 +61,14 @@ app.MapPost("/upload", async (HttpRequest req, IVideoProcessor processor) =>
 {
     var url = req.Query["url"].ToString();
     var filename = req.Query["filename"].ToString();
-    var outputDir = req.Query["outputDir"].ToString();
-
+    var outputDir = videoDir+req.Query["outputDir"].ToString();
+    var outputDir2 = req.Query["outputDir"].ToString();
     if (string.IsNullOrWhiteSpace(url))
         return Results.BadRequest(new { error = "URL is required" });
 
-    var result = await processor.ConvertToHlsAsync(url, filename, outputDir, req.Scheme, req.Host.ToString());
+    if (!Directory.Exists(outputDir))
+        Directory.CreateDirectory(outputDir);
+    var result = await processor.ConvertToHlsAsync(url, filename, outputDir2, req.Scheme, req.Host.ToString());
     return result.Success
         ? Results.Ok(result)
         : Results.Problem(result.Error, statusCode: 500);
@@ -230,11 +244,12 @@ public class VideoProcessor : IVideoProcessor
     private (string outputPath, string segmentPattern, string relativePath) PrepareHlsOutput(string? filename, string? outputDir)
     {
         var name = NormalizeFilename(filename);
-        var directory = string.IsNullOrWhiteSpace(outputDir)
-            ? Path.Combine(Directory.GetCurrentDirectory(), "videos")
-            : Path.Combine(_settings.RootDirectory, outputDir);
 
-        Directory.CreateDirectory(directory);
+        var videoDir = Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
+        var directory = videoDir + outputDir;
+
+        if (!Directory.Exists(directory))
+            Directory.CreateDirectory(directory);
 
         var m3u8File = $"{name}.m3u8";
         var outputPath = Path.Combine(directory, m3u8File);
