@@ -1,13 +1,21 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
+using PinterestAPI.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services
+// Add services
+builder.Services.AddSingleton<IimageProcessor, ImageProcessor>();
 builder.Services.AddSingleton<IVideoProcessor, VideoProcessor>();
 builder.Services.Configure<VideoSettings>(builder.Configuration.GetSection("VideoSettings"));
+builder.Services.Configure<ImageSettings>(builder.Configuration.GetSection("ImageSettings"));
+
+// Add Antiforgery - .NET 8+ only
+builder.Services.AddAntiforgery();  // <-- register antiforgery services
 
 // Add CORS services
 builder.Services.AddCors(options =>
@@ -40,13 +48,29 @@ app.MapGet("/", () => Results.Ok(new
     status = "Video Processing API is running",
     endpoints = new[]
     {
-        "POST /download?url=...&filename=...",
-        "POST /upload?url=...&filename=...&outputDir=...",
-        "POST /fetch?url=...&filename=...&outputDir=..."
+        "POST /image/upload?path=...",
+        "POST /image/upload/base64?filename=...&outputDir=...",
+        "POST /video/download?url=...&filename=...",
+        "POST /video/upload?url=...&filename=...&outputDir=...",
+        "POST /video/fetch?url=...&filename=...&outputDir=..."
     }
 }));
 
-app.MapPost("/download", async (string url, string? filename, IVideoProcessor processor) =>
+app.MapPost("/image/upload", async (HttpRequest req, IimageProcessor processor) =>
+{
+    var form = await req.ReadFormAsync();
+    var file = form.Files.GetFile("file"); // name must match the multipart field
+    var fileName = req.Query["fileName"].ToString();
+    var path = req.Query["path"].ToString();
+
+    if (file == null) return Results.BadRequest(new { error = "file is required" });
+
+    processor.Host = $"{req.Scheme}://{req.Host}/";
+    var result = await processor.UploadImageAsync(file, fileName, path);
+    return result.Success ? Results.Ok(result) : Results.Problem(result.Message,null, 500);
+}).DisableAntiforgery(); // opt out for just this endpoint;
+
+app.MapPost("/video/download", async (string url, string? filename, IVideoProcessor processor) =>
 {
     if (string.IsNullOrWhiteSpace(url))
         return Results.BadRequest(new { error = "URL is required" });
@@ -54,10 +78,10 @@ app.MapPost("/download", async (string url, string? filename, IVideoProcessor pr
     var result = await processor.DownloadVideoAsync(url, filename);
     return result.Success
         ? Results.Ok(result)
-        : Results.Problem(result.Error, statusCode: 500);
+        : Results.Problem(result.Message, statusCode: 500);
 });
 
-app.MapPost("/upload", async (HttpRequest req, IVideoProcessor processor) =>
+app.MapPost("/video/upload", async (HttpRequest req, IVideoProcessor processor) =>
 {
     var url = req.Query["url"].ToString();
     var filename = req.Query["filename"].ToString();
@@ -71,10 +95,10 @@ app.MapPost("/upload", async (HttpRequest req, IVideoProcessor processor) =>
     var result = await processor.ConvertToHlsAsync(url, filename, outputDir2, req.Scheme, req.Host.ToString());
     return result.Success
         ? Results.Ok(result)
-        : Results.Problem(result.Error, statusCode: 500);
+        : Results.Problem(result.Message, statusCode: 500);
 });
 
-app.MapPost("/fetch", async (HttpRequest req, IVideoProcessor processor) =>
+app.MapPost("/video/fetch", async (HttpRequest req, IVideoProcessor processor) =>
 {
     var url = req.Query["url"].ToString();
     var filename = req.Query["filename"].ToString();
@@ -86,11 +110,12 @@ app.MapPost("/fetch", async (HttpRequest req, IVideoProcessor processor) =>
     var result = await processor.FetchAsHlsAsync(url, filename, outputDir, req.Scheme, req.Host.ToString());
     return result.Success
         ? Results.Ok(result)
-        : Results.Problem(result.Error, statusCode: 500);
+        : Results.Problem(result.Message, statusCode: 500);
 });
 
 app.Run();
 
+#region VideoSettings
 // Helper methods
 static FileExtensionContentTypeProvider GetContentTypeProvider()
 {
@@ -110,9 +135,9 @@ public class VideoSettings
 
 public interface IVideoProcessor
 {
-    Task<ProcessResult> DownloadVideoAsync(string url, string? filename);
-    Task<ProcessResult> ConvertToHlsAsync(string url, string? filename, string? outputDir, string scheme, string host);
-    Task<ProcessResult> FetchAsHlsAsync(string url, string? filename, string? outputDir, string scheme, string host);
+    Task<ResultModel> DownloadVideoAsync(string url, string? filename);
+    Task<ResultModel> ConvertToHlsAsync(string url, string? filename, string? outputDir, string scheme, string host);
+    Task<ResultModel> FetchAsHlsAsync(string url, string? filename, string? outputDir, string scheme, string host);
 }
 
 public class VideoProcessor : IVideoProcessor
@@ -126,7 +151,7 @@ public class VideoProcessor : IVideoProcessor
         _logger = logger;
     }
 
-    public async Task<ProcessResult> DownloadVideoAsync(string url, string? filename)
+    public async Task<ResultModel> DownloadVideoAsync(string url, string? filename)
     {
         try
         {
@@ -146,11 +171,11 @@ public class VideoProcessor : IVideoProcessor
         catch (Exception ex)
         {
             _logger.LogError(ex, "Download failed for URL: {Url}", url);
-            return ProcessResult.Failure($"Download failed: {ex.Message}");
+            return ResultModel.Failure($"Download failed: {ex.Message}");
         }
     }
 
-    public async Task<ProcessResult> ConvertToHlsAsync(string url, string? filename, string? outputDir, string scheme, string host)
+    public async Task<ResultModel> ConvertToHlsAsync(string url, string? filename, string? outputDir, string scheme, string host)
     {
         try
         {
@@ -176,11 +201,11 @@ public class VideoProcessor : IVideoProcessor
         catch (Exception ex)
         {
             _logger.LogError(ex, "HLS conversion failed for URL: {Url}", url);
-            return ProcessResult.Failure($"Conversion failed: {ex.Message}");
+            return ResultModel.Failure($"Conversion failed: {ex.Message}");
         }
     }
 
-    public async Task<ProcessResult> FetchAsHlsAsync(string url, string? filename, string? outputDir, string scheme, string host)
+    public async Task<ResultModel> FetchAsHlsAsync(string url, string? filename, string? outputDir, string scheme, string host)
     {
         try
         {
@@ -207,11 +232,11 @@ public class VideoProcessor : IVideoProcessor
         catch (Exception ex)
         {
             _logger.LogError(ex, "HLS fetch failed for URL: {Url}", url);
-            return ProcessResult.Failure($"Fetch failed: {ex.Message}");
+            return ResultModel.Failure($"Fetch failed: {ex.Message}");
         }
     }
 
-    private async Task<ProcessResult> RunFfmpegAsync(string arguments)
+    private async Task<ResultModel> RunFfmpegAsync(string arguments)
     {
         using var process = new Process
         {
@@ -234,11 +259,11 @@ public class VideoProcessor : IVideoProcessor
         if (process.ExitCode == 0)
         {
             _logger.LogInformation("FFmpeg process completed successfully");
-            return ProcessResult.Ok();
+            return ResultModel.Ok();
         }
 
         _logger.LogError("FFmpeg failed with exit code {ExitCode}: {Error}", process.ExitCode, stderr);
-        return ProcessResult.Failure($"FFmpeg failed with exit code {process.ExitCode}");
+        return ResultModel.Failure($"FFmpeg failed with exit code {process.ExitCode}");
     }
 
     private (string outputPath, string segmentPattern, string relativePath) PrepareHlsOutput(string? filename, string? outputDir)
@@ -269,12 +294,68 @@ public class VideoProcessor : IVideoProcessor
     }
 }
 
-public class ProcessResult
-{
-    public bool Success { get; set; }
-    public string? Error { get; set; }
-    public object? Data { get; set; }
+#endregion
 
-    public static ProcessResult Ok(object? data = null) => new() { Success = true, Data = data };
-    public static ProcessResult Failure(string error) => new() { Success = false, Error = error };
+#region ImageSettings
+// Helper methods
+
+public class ImageSettings
+{
+    public string RootDirectory { get; set; } = "wwwroot";
 }
+public interface IimageProcessor
+{
+    public string Host { get; set; }
+    Task<ResultModel> UploadImageAsync(IFormFile file, string? fileName = "", string? formPath = "");
+}
+
+public class ImageProcessor : IimageProcessor
+{
+    public string Host { get; set; }
+    private readonly ImageSettings _settings;
+    private readonly ILogger<ImageProcessor> _logger;
+    private readonly IWebHostEnvironment _env;
+
+    public ImageProcessor(IOptions<ImageSettings> settings, ILogger<ImageProcessor> logger, IWebHostEnvironment env)
+    {
+        _settings = settings.Value;
+        _logger = logger;
+        _env = env;
+    }
+
+    public async Task<ResultModel> UploadImageAsync(IFormFile file, string? fileName = null, string? formPath = "/default")
+    {
+        try
+        {
+            if (file == null) return ResultModel.Failure("No file provided");
+            if (!string.IsNullOrEmpty(fileName))
+                fileName = $"{DateTime.Now:yyMMddHHmmssfff}";
+            formPath ??= "";
+            formPath = formPath.Trim().Replace('/', Path.DirectorySeparatorChar);
+
+            var wwwRoot = _env.WebRootPath ?? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
+            var ext = Path.GetExtension(file.FileName);
+            fileName = fileName + ext;
+            var dir = wwwRoot + formPath;
+            if (!Directory.Exists(dir))
+                Directory.CreateDirectory(dir);
+
+            var path = dir + fileName;
+            await using (var fs = new FileStream(path, FileMode.Create))
+                await file.CopyToAsync(fs);
+
+            var relativePath = Path.Combine(formPath, fileName).Replace("\\", "/").TrimStart('/');
+            var result = ResultModel.Ok();
+            result.Data = Host+relativePath;
+            result.Success = true;
+            result.Message = "File uploaded successfully";
+            return result;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Image upload failed");
+            return ResultModel.Failure($"Upload failed: {ex.Message}");
+        }
+    }
+}
+#endregion
