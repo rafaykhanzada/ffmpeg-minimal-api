@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.FileProviders;
-using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using PinterestAPI.Models;
 
@@ -51,6 +50,7 @@ app.MapGet("/", () => Results.Ok(new
         "POST /image/upload?path=...",
         "POST /image/upload/base64?filename=...&outputDir=...",
         "POST /video/download?url=...&filename=...",
+        "POST /video/upload?file=...&filename=...&outputDir=...",
         "POST /video/upload?url=...&filename=...&outputDir=...",
         "POST /video/fetch?url=...&filename=...&outputDir=..."
     }
@@ -70,6 +70,26 @@ app.MapPost("/image/upload", async (HttpRequest req, IimageProcessor processor) 
     return result.Success ? Results.Ok(result) : Results.Problem(result.Message,null, 500);
 }).DisableAntiforgery(); // opt out for just this endpoint;
 
+app.MapPost("/video/upload-file", async (HttpRequest req, IimageProcessor fileprocessor, IVideoProcessor processor) =>
+{
+    var form = await req.ReadFormAsync();
+    var file = form.Files.GetFile("file"); // name must match the multipart field
+    string url = string.Empty;
+    var filename = req.Query["filename"].ToString();
+    var outputDir = req.Query["outputDir"].ToString();
+
+    if (file == null) return Results.BadRequest(new { error = "file is required" });
+
+    fileprocessor.Host = $"{req.Scheme}://{req.Host}/";
+    var result = await fileprocessor.UploadImageAsync(file, filename, outputDir);
+
+    if (!Directory.Exists(outputDir))
+        Directory.CreateDirectory(outputDir);
+    result = await processor.ConvertToHlsAsync(result.Data.ToString()!, filename, outputDir, req.Scheme, req.Host.ToString());
+    return result.Success
+        ? Results.Ok(result)
+        : Results.Problem(result.Message, statusCode: 500);
+});
 app.MapPost("/video/download", async (string url, string? filename, IVideoProcessor processor) =>
 {
     if (string.IsNullOrWhiteSpace(url))
@@ -328,14 +348,14 @@ public class ImageProcessor : IimageProcessor
         try
         {
             if (file == null) return ResultModel.Failure("No file provided");
-            if (!string.IsNullOrEmpty(fileName))
+            if (string.IsNullOrEmpty(fileName))
                 fileName = $"{DateTime.Now:yyMMddHHmmssfff}";
             formPath ??= "";
             formPath = formPath.Trim().Replace('/', Path.DirectorySeparatorChar);
 
             var wwwRoot = _env.WebRootPath ?? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
             var ext = Path.GetExtension(file.FileName);
-            fileName = fileName + ext;
+            //fileName = fileName + ext;
             var dir = wwwRoot + formPath;
             if (!Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
