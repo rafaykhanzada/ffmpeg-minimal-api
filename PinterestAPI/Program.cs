@@ -360,7 +360,7 @@ public class ImageProcessor : IimageProcessor
             if (!Directory.Exists(dir))
                 Directory.CreateDirectory(dir);
 
-            var path = dir + fileName;
+            var path = Path.Combine(dir, fileName);
             await using (var fs = new FileStream(path, FileMode.Create))
                 await file.CopyToAsync(fs);
 
